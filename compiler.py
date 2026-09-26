@@ -19,36 +19,12 @@ import machine
 def compile_program(program: dict) -> dict:
     """Compile one validated IR program into scratch allocations and bundles."""
 
-    # A simple non-overlapping allocation. Vectors are placed first so their
-    # alignment does not create holes between scalar values.
-    scratch: dict[str, int] = {}
-    cursor = 0
     operations = program["operations"]
 
-    for result_kind in ("vector", "scalar"):
-        for operation in operations:
-            spec = machine.OP_SPECS[operation["op"]]
-            if spec["result"] != result_kind:
-                continue
-            dest = operation["dest"]
-            if result_kind == "vector":
-                cursor = machine.align_up(cursor, machine.VLEN)
-                scratch[dest] = cursor
-                cursor += machine.VLEN
-            else:
-                scratch[dest] = cursor
-                cursor += 1
-
-    if cursor > machine.SCRATCH_WORDS:
-        raise machine.CompileError(
-            f"program requires {cursor} scratch words, limit is {machine.SCRATCH_WORDS}"
-        )
-
-    # Build precedence edges. A data edge carries the producer latency; memory
-    # edges carry one cycle because ordered accesses must issue separately.
     producer = machine.producer_map(program)
     successors: list[list[tuple[int, int]]] = [[] for _ in operations]
     dependency_edges: list[list[tuple[int, int]]] = [[] for _ in operations]
+
     for operation in operations:
         op_id = operation["id"]
         predecessors = {}
@@ -61,13 +37,19 @@ def compile_program(program: dict) -> dict:
             successors[pred_id].append((op_id, delay))
             dependency_edges[op_id].append((pred_id, delay))
 
-    # Critical-path priority keeps long latency chains moving. Ties favor
-    # engines with more ready work per available slot, then source order.
+    # Bottom-level priority measures the remaining dependency delay from each
+    # operation. Edge weights matter: data edges wait for producer latency,
+    # while memory-order edges only require a later issue cycle. Ties favor
+    # crowded engines, then source order.
     critical_path = [0] * len(operations)
     for op_id in range(len(operations) - 1, -1, -1):
-        latency = machine.OP_SPECS[operations[op_id]["op"]]["latency"]
-        critical_path[op_id] = latency + max(
-            (critical_path[succ] for succ, _ in successors[op_id]), default=0
+        own_latency = machine.OP_SPECS[operations[op_id]["op"]]["latency"]
+        critical_path[op_id] = max(
+            own_latency,
+            max(
+                (delay + critical_path[succ] for succ, delay in successors[op_id]),
+                default=0,
+            ),
         )
 
     unscheduled = set(range(len(operations)))
@@ -114,7 +96,91 @@ def compile_program(program: dict) -> dict:
             remaining -= 1
         cycle += 1
 
+    scratch = _allocate_scratch(program, issue_cycle)
     return {"scratch": scratch, "bundles": bundles}
+
+
+def _allocate_scratch(program: dict, issue_cycle: dict[int, int]) -> dict[str, int]:
+    """Reuse best-fit free blocks as scheduled live intervals expire."""
+    operations = program["operations"]
+    lifetimes: dict[str, list[int]] = {}
+    for operation in operations:
+        if "dest" in operation:
+            ready = (
+                issue_cycle[operation["id"]]
+                + machine.OP_SPECS[operation["op"]]["latency"]
+            )
+            lifetimes[operation["dest"]] = [ready, ready]
+    for operation in operations:
+        for arg in operation.get("args", []):
+            lifetimes[arg][1] = max(lifetimes[arg][1], issue_cycle[operation["id"]])
+
+    kinds = machine.result_kinds(program)
+    values = sorted(lifetimes, key=lambda name: (lifetimes[name][0], -lifetimes[name][1]))
+
+    scratch: dict[str, int] = {}
+    free_blocks: list[tuple[int, int]] = []
+    active: list[tuple[int, str, int, int]] = []
+    cursor = 0
+
+    def add_free(start: int, end: int) -> None:
+        if start < end:
+            free_blocks.append((start, end))
+            free_blocks.sort()
+            merged: list[tuple[int, int]] = []
+
+            for block_start, block_end in free_blocks:
+                if merged and block_start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], block_end))
+                else:
+                    merged.append((block_start, block_end))
+            free_blocks[:] = merged
+
+    def trim_top() -> None:
+        nonlocal cursor
+        while free_blocks and free_blocks[-1][1] == cursor:
+            cursor = free_blocks.pop()[0]
+
+    for name in values:
+        start, end = lifetimes[name]
+        still_active = []
+        for active_end, active_name, base, width in active:
+            if active_end < start:
+                add_free(base, base + width)
+            else:
+                still_active.append((active_end, active_name, base, width))
+        active = still_active
+        trim_top()
+
+        width = machine.VLEN if kinds[name] == "vector" else 1
+        alignment = machine.VLEN if kinds[name] == "vector" else 1
+        candidates = []
+        for index, (block_start, block_end) in enumerate(free_blocks):
+            base = machine.align_up(block_start, alignment)
+            if base + width <= block_end:
+                candidates.append((block_end - block_start - width, block_start, index, base))
+
+        if candidates:
+            _waste, block_start, block_index, base = min(candidates)
+            block_start, block_end = free_blocks.pop(block_index)
+            if block_start < base:
+                add_free(block_start, base)
+            if base + width < block_end:
+                add_free(base + width, block_end)
+        else:
+            base = machine.align_up(cursor, alignment)
+            if cursor < base:
+                add_free(cursor, base)
+            cursor = base + width
+            if cursor > machine.SCRATCH_WORDS:
+                raise machine.CompileError(
+                    f"program requires {cursor} scratch words, limit is {machine.SCRATCH_WORDS}"
+                )
+
+        scratch[name] = base
+        active.append((end, name, base, width))
+
+    return scratch
 
 
 def main(argv: list[str]) -> int:
